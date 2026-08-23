@@ -47,9 +47,15 @@ export async function recoverPersistedVectorIndex({
         `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
         `vectors. Live observations will rebuild the index over time.`,
     );
-    await persistence.save().catch((error) => {
-      warn("[agentmemory] Failed to persist cleared vector index:", error);
-    });
+    try {
+      await persistence.save({ throwOnError: true });
+    } catch (error) {
+      warn(
+        "[agentmemory] Failed to persist cleared vector index; startup remains blocked:",
+        error,
+      );
+      throw error;
+    }
     return "dropped";
   }
 

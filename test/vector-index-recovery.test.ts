@@ -63,6 +63,47 @@ describe("recoverPersistedVectorIndex", () => {
     expect((await persistence.load()).vector?.size).toBe(0);
   });
 
+  it("fails startup when the cleared vector snapshot cannot be persisted", async () => {
+    const kv = mockKV();
+    const staleVector = new VectorIndex();
+    staleVector.add("obs_stale", "ses_1", new Float32Array([0.1, 0.2, 0.3]));
+    await new IndexPersistence(kv as never, new SearchIndex(), staleVector, {
+      createGeneration: () => "stale",
+    }).save();
+
+    const persistenceError = new Error("state unavailable");
+    const failingKv = {
+      ...kv,
+      set: vi.fn(async () => {
+        throw persistenceError;
+      }),
+    };
+    const persistence = new IndexPersistence(
+      failingKv as never,
+      new SearchIndex(),
+      new VectorIndex(),
+    );
+    const loaded = await persistence.load();
+    const warn = vi.fn();
+
+    await expect(
+      recoverPersistedVectorIndex({
+        persistedIndex: loaded.vector!,
+        activeIndex: new VectorIndex(),
+        expectedDimensions: 4,
+        providerName: "test-4d",
+        dropStale: true,
+        persistence,
+        paths,
+        warn,
+      }),
+    ).rejects.toThrow("state unavailable");
+    expect(warn).toHaveBeenLastCalledWith(
+      "[agentmemory] Failed to persist cleared vector index; startup remains blocked:",
+      persistenceError,
+    );
+  });
+
   it("identifies the exact config and env paths in recovery guidance", async () => {
     const persistedIndex = new VectorIndex();
     persistedIndex.add(
