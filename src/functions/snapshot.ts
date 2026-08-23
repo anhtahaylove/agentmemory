@@ -17,7 +17,7 @@ import {
   indexGraphNodeOrInvalidate,
   initializeGraphIndexes,
   readIndexedGraph,
-  withGraphIndexMutation,
+  withFailClosedGraphMutation,
 } from "../state/graph-indexes.js";
 import { rebuildGraphSnapshotOrInvalidateInMutation } from "./graph.js";
 import { recordAudit } from "./audit.js";
@@ -244,7 +244,7 @@ export function registerSnapshotFunction(
           }
         }
         if (state.graphNodes) {
-          await withGraphIndexMutation(async () => {
+          await withFailClosedGraphMutation(kv, "graph snapshot restore", async () => {
             const readiness = await graphIndexReadiness(kv);
             if (!readiness.ready || !readiness.generation) {
               throw new Error("Graph read indexes unavailable");

@@ -18,6 +18,7 @@ import {
   markGraphIndexesUnavailable,
   readIndexedGraph,
   resetGraphIndexes,
+  withFailClosedGraphMutation,
   withGraphIndexMutation,
 } from "../state/graph-indexes.js";
 import {
@@ -709,7 +710,7 @@ async function persistGraphDeltaUnlocked(
       "Graph writes require a snapshot matched to the active index generation.",
     );
   }
-  const reader = await GraphIndexReader.open(kv);
+  const reader = await GraphIndexReader.open(kv, readiness.generation);
   if (!reader) throw new Error("Graph read indexes became unavailable.");
   const indexedNodeIds = new Set(
     (await reader.getNameCatalog()).map((entry) => entry.id),
@@ -866,7 +867,7 @@ export async function persistGraphDelta(
   edges: GraphEdge[],
   obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
-  return withGraphIndexMutation(() =>
+  return withFailClosedGraphMutation(kv, "graph persistence", () =>
     persistGraphDeltaUnlocked(kv, nodes, edges, obsIds),
   );
 }
@@ -967,7 +968,7 @@ export async function rebuildGraphSnapshotFromIndexes(
         "Graph snapshot rebuild requires generation-matched read indexes.",
       );
     }
-    return rebuildGraphSnapshotFromIndexesInMutation(
+    return rebuildGraphSnapshotOrInvalidateInMutation(
       kv,
       readiness.generation,
     );
@@ -1127,10 +1128,18 @@ export function registerGraphFunction(
         };
       }
 
-      const reader = await GraphIndexReader.open(kv);
-      if (reader && readiness.ready) {
+      const expectedGeneration =
+        readiness.ready &&
+        viewReadiness.ready &&
+        readiness.generation === viewReadiness.generation
+          ? readiness.generation
+          : undefined;
+      const reader = expectedGeneration
+        ? await GraphIndexReader.open(kv, expectedGeneration)
+        : null;
+      if (reader) {
         const matchedSnapshot =
-          snapshot?.indexGeneration === readiness.generation
+          snapshot?.indexGeneration === expectedGeneration
             ? snapshot
             : null;
         const result = data.query
@@ -1154,9 +1163,18 @@ export function registerGraphFunction(
         }
       }
 
+      const fallbackReadiness = await graphIndexReadiness(kv).catch(() => null);
+      const stableSnapshot =
+        snapshot &&
+        expectedGeneration &&
+        fallbackReadiness?.ready &&
+        fallbackReadiness.generation === expectedGeneration &&
+        snapshot.indexGeneration === expectedGeneration
+          ? snapshot
+          : null;
       return {
-        ...(snapshot
-          ? paginateFromSnapshot(snapshot, data.nodeType, limit, offset)
+        ...(stableSnapshot
+          ? paginateFromSnapshot(stableSnapshot, data.nodeType, limit, offset)
           : {
               nodes: [],
               edges: [],
@@ -1170,7 +1188,8 @@ export function registerGraphFunction(
         indexStatus: "unavailable",
         warning:
           "Graph read indexes are unavailable or changed during the requested " +
-          "search or traversal. The response is snapshot-only. Run graph reset " +
+          "search or traversal. Any snapshot response is generation-matched. " +
+          "Run graph reset " +
           "to start a new indexed generation; complete legacy recovery requires " +
           "paginated state scanning.",
       };

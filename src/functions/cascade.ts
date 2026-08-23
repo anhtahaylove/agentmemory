@@ -6,7 +6,7 @@ import {
   GraphIndexReader,
   graphIndexReadiness,
   removeGraphNodeFromIndexOrInvalidate,
-  withGraphIndexMutation,
+  withFailClosedGraphMutation,
 } from "../state/graph-indexes.js";
 import { recordAudit } from "./audit.js";
 import { rebuildGraphSnapshotOrInvalidateInMutation } from "./graph.js";
@@ -30,10 +30,10 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
       const obsIds = new Set(superseded.sourceObservationIds || []);
 
       if (obsIds.size > 0) {
-        await withGraphIndexMutation(async () => {
+        await withFailClosedGraphMutation(kv, "graph cascade update", async () => {
           const readiness = await graphIndexReadiness(kv);
           if (!readiness.ready || !readiness.generation) return;
-          const reader = await GraphIndexReader.open(kv);
+          const reader = await GraphIndexReader.open(kv, readiness.generation);
           if (!reader) return;
           const nodes = [];
           const edges = new Map<string, GraphEdge>();

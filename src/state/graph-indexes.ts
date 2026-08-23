@@ -210,6 +210,42 @@ export function withGraphIndexMutation<T>(fn: () => Promise<T>): Promise<T> {
   return withKeyedLock("gidx:mutation", fn);
 }
 
+async function failClosedGraphMutation<T>(
+  kv: StateKV,
+  operation: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const before = await graphIndexReadiness(kv).catch(() => null);
+  let expectedGeneration = before?.ready ? before.generation : undefined;
+  try {
+    return await fn();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!expectedGeneration) {
+      const current = await graphIndexReadiness(kv).catch(() => null);
+      expectedGeneration = current?.ready ? current.generation : undefined;
+    }
+    if (expectedGeneration) {
+      await markGraphIndexesUnavailable(
+        kv,
+        `${operation} failed after graph mutation started: ${message}`,
+        expectedGeneration,
+      ).catch(() => {});
+    }
+    throw error instanceof Error ? error : new Error(message);
+  }
+}
+
+export function withFailClosedGraphMutation<T>(
+  kv: StateKV,
+  operation: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withGraphIndexMutation(() =>
+    failClosedGraphMutation(kv, operation, fn),
+  );
+}
+
 async function readyGeneration(
   kv: StateKV,
   expectedGeneration?: string,
@@ -472,9 +508,18 @@ export class GraphIndexReader {
     private generation: string,
   ) {}
 
-  static async open(kv: StateKV): Promise<GraphIndexReader | null> {
+  static async open(
+    kv: StateKV,
+    expectedGeneration?: string,
+  ): Promise<GraphIndexReader | null> {
     const readiness = await graphIndexReadiness(kv);
-    if (!readiness.ready || !readiness.generation) return null;
+    if (
+      !readiness.ready ||
+      !readiness.generation ||
+      (expectedGeneration && readiness.generation !== expectedGeneration)
+    ) {
+      return null;
+    }
     return new GraphIndexReader(kv, readiness.generation);
   }
 
@@ -539,10 +584,10 @@ export class GraphIndexReader {
       this.generation,
       nodeId,
     );
-    const boundedEdgeIds = edgeIds.slice(0, maxEdges);
-    for (const edgeId of boundedEdgeIds) this.indexedEdgeIds.add(edgeId);
     const edges: GraphEdge[] = [];
-    for (const edgeId of boundedEdgeIds) {
+    for (const edgeId of edgeIds) {
+      if (edges.length >= maxEdges) break;
+      this.indexedEdgeIds.add(edgeId);
       const edge = await this.getEdge(edgeId);
       if (
         edge &&

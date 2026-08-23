@@ -36,12 +36,20 @@ function mockKV(nodes: GraphNode[] = [], edges: GraphEdge[] = []) {
   const calls: Array<{ operation: "get" | "list" | "listGroups"; scope?: string; key?: string }> = [];
   let failNextGetScope: string | undefined;
   let failNextSetScope: string | undefined;
+  let getHook:
+    | { scope: string; remaining: number; fn: () => Promise<void> }
+    | undefined;
   store.set(KV.graphNodes, new Map(nodes.map((node) => [node.id, node])));
   store.set(KV.graphEdges, new Map(edges.map((edge) => [edge.id, edge])));
 
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       calls.push({ operation: "get", scope, key });
+      if (getHook?.scope === scope && --getHook.remaining === 0) {
+        const hook = getHook.fn;
+        getHook = undefined;
+        await hook();
+      }
       if (failNextGetScope === scope) {
         failNextGetScope = undefined;
         throw new Error(`injected ${scope} read failure`);
@@ -76,6 +84,9 @@ function mockKV(nodes: GraphNode[] = [], edges: GraphEdge[] = []) {
     },
     failNextSet: (scope: string) => {
       failNextSetScope = scope;
+    },
+    onGet: (scope: string, occurrence: number, fn: () => Promise<void>) => {
+      getHook = { scope, remaining: occurrence, fn };
     },
     graphListCallCount: () =>
       calls.filter(
@@ -424,6 +435,35 @@ describe("graph index parity and readiness", () => {
     expect(kv.graphListCallCount()).toBe(0);
   });
 
+  it("invalidates readiness when a post-primary write fails", async () => {
+    const kv = mockKV();
+    await initializeGraphIndexes(kv as never);
+    const incoming = makeNode("partial-secondary", "Partial secondary");
+    kv.failNextSet(KV.graphNameIndex);
+
+    await expect(
+      persistGraphDelta(kv as never, [incoming], [], []),
+    ).rejects.toThrow(/injected/);
+    expect(await kv.get(KV.graphNodes, incoming.id)).toEqual(incoming);
+    expect((await graphIndexReadiness(kv as never)).status).toBe(
+      "unavailable",
+    );
+  });
+
+  it("invalidates readiness when the final snapshot write fails", async () => {
+    const kv = mockKV();
+    await initializeGraphIndexes(kv as never);
+    const incoming = makeNode("partial-snapshot", "Partial snapshot");
+    kv.failNextSet(KV.graphSnapshot);
+
+    await expect(
+      persistGraphDelta(kv as never, [incoming], [], []),
+    ).rejects.toThrow(/injected/);
+    expect((await graphIndexReadiness(kv as never)).status).toBe(
+      "unavailable",
+    );
+  });
+
   it("graph reset starts a fresh ready generation and hides old hints", async () => {
     const legacy = makeNode("legacy", "Legacy");
     const kv = mockKV([legacy]);
@@ -468,6 +508,51 @@ describe("graph index parity and readiness", () => {
     expect(await loadNameCatalog(kv as never)).toEqual([
       { id: "n1", name: "New name" },
     ]);
+  });
+
+  it("does not mix a captured snapshot with a replacement generation", async () => {
+    const kv = mockKV();
+    const oldNode = makeNode(
+      "same-id",
+      "stable-name",
+      "concept",
+      ["obs_old"],
+      { tag: "old-only-token" },
+    );
+    await persistGraphDelta(kv as never, [oldNode], [], []);
+    const sdk = mockSdk();
+    registerGraphFunction(sdk as never, kv as never, noopProvider as never);
+    kv.clearCalls();
+    kv.onGet(KV.graphIndexMeta, 3, async () => {
+      await sdk.trigger("mem::graph-reset", {});
+      await persistGraphDelta(
+        kv as never,
+        [{ ...oldNode, properties: { tag: "replacement" } }],
+        [],
+        [],
+      );
+    });
+
+    const result = (await sdk.trigger("mem::graph-query", {
+      query: "old-only-token",
+    })) as GraphQueryResult;
+
+    expect(result).toMatchObject({ nodes: [], indexStatus: "unavailable" });
+    expect(result.warning).toMatch(/changed|generation/i);
+  });
+
+  it("applies incident-edge caps after discarding stale adjacency hints", async () => {
+    const left = makeNode("left", "Left");
+    const middle = makeNode("middle", "Middle");
+    const right = makeNode("right", "Right");
+    const stale = makeEdge("edge-stale", left.id, middle.id);
+    const live = makeEdge("edge-live", left.id, right.id);
+    const kv = await indexedKV([left, middle, right], [stale, live]);
+    await kv.set(KV.graphEdges, stale.id, { ...stale, stale: true });
+
+    const reader = await GraphIndexReader.open(kv as never);
+    expect((await reader!.getIncidentEdges(left.id, 1)).map((edge) => edge.id))
+      .toEqual([live.id]);
   });
 
   it("indexes current heuristic persistence without enumerating graph scopes", async () => {

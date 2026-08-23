@@ -14,7 +14,7 @@ import {
   graphIndexReadiness,
   indexGraphEdgeOrInvalidate,
   indexGraphNodeOrInvalidate,
-  withGraphIndexMutation,
+  withFailClosedGraphMutation,
 } from "../state/graph-indexes.js";
 import { rebuildGraphSnapshotOrInvalidateInMutation } from "./graph.js";
 import { logger } from "../logger.js";
@@ -217,12 +217,15 @@ export function registerTemporalGraphFunctions(
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseTemporalGraphXml(response, obsIds);
 
-        await withGraphIndexMutation(async () => {
+        await withFailClosedGraphMutation(kv, "temporal graph extraction", async () => {
           const readiness = await graphIndexReadiness(kv);
           if (!readiness.ready || !readiness.generation) {
             throw new Error("Graph read indexes became unavailable");
           }
-          const currentReader = await GraphIndexReader.open(kv);
+          const currentReader = await GraphIndexReader.open(
+            kv,
+            readiness.generation,
+          );
           if (!currentReader) {
             throw new Error("Graph read indexes became unavailable");
           }

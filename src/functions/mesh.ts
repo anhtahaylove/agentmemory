@@ -9,7 +9,7 @@ import {
   indexGraphNodeOrInvalidate,
   initializeGraphIndexes,
   readIndexedGraph,
-  withGraphIndexMutation,
+  withFailClosedGraphMutation,
 } from "../state/graph-indexes.js";
 import { recordAudit } from "./audit.js";
 import { rebuildGraphSnapshotOrInvalidateInMutation } from "./graph.js";
@@ -466,7 +466,7 @@ export function registerMeshFunction(
         }
       }
       if (hasGraphRecords(data)) {
-        accepted += await withGraphIndexMutation(async () => {
+        accepted += await withFailClosedGraphMutation(kv, "mesh graph receive", async () => {
           const readiness = await graphIndexReadiness(kv);
           if (!readiness.ready || !readiness.generation) {
             throw new Error("Graph read indexes unavailable");
@@ -632,7 +632,7 @@ async function applySyncData(
     }
   }
   if (hasGraphRecords(graphPayload)) {
-    applied += await withGraphIndexMutation(async () => {
+    applied += await withFailClosedGraphMutation(kv, "mesh graph sync", async () => {
       const readiness = await graphIndexReadiness(kv);
       if (!readiness.ready || !readiness.generation) {
         throw new Error("Graph read indexes unavailable");

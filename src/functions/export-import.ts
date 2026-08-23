@@ -34,7 +34,7 @@ import {
   initializeGraphIndexes,
   readIndexedGraph,
   resetGraphIndexes,
-  withGraphIndexMutation,
+  withFailClosedGraphMutation,
 } from "../state/graph-indexes.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
@@ -513,14 +513,14 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       });
 
       if (hasGraphData) {
-        await withGraphIndexMutation(async () => {
+        await withFailClosedGraphMutation(kv, "graph import", async () => {
           const readiness = await initializeGraphIndexes(kv);
           if (!readiness.ready || !readiness.generation) {
             throw new Error(
               "Graph import requires generation-matched read indexes.",
             );
           }
-          const reader = await GraphIndexReader.open(kv);
+          const reader = await GraphIndexReader.open(kv, readiness.generation);
           if (!reader) throw new Error("Graph read indexes unavailable");
           const activeNodeIds = new Set(
             (await reader.getNameCatalog()).map((entry) => entry.id),
