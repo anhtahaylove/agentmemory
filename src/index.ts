@@ -1,5 +1,6 @@
-import { registerWorker } from "iii-sdk";
+import { registerWorker, TriggerAction } from "iii-sdk";
 import {
+  hydrateProcessEnvFromFile,
   loadConfig,
   getEnvVar,
   loadEmbeddingConfig,
@@ -25,6 +26,7 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
+import { recoverPersistedVectorIndex } from "./state/vector-index-recovery.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -38,6 +40,8 @@ import {
   getSearchIndex,
   setVectorIndex,
   setEmbeddingProvider,
+  setIndexPersistence,
+  setHybridRanker,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
@@ -50,12 +54,14 @@ import { registerEvictFunction } from "./functions/evict.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
+import { registerRecentSearchesSweepFunction } from "./functions/recent-searches-sweep.js";
 import { registerProfileFunction } from "./functions/profile.js";
 import { registerAutoForgetFunction } from "./functions/auto-forget.js";
 import { registerExportImportFunction } from "./functions/export-import.js";
 import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
+import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
 import { registerGovernanceFunction } from "./functions/governance.js";
@@ -98,6 +104,27 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
+import { runtimeMetadataPath } from "./runtime-paths.js";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
+
+function workerPidfilePath(): string {
+  return runtimeMetadataPath("worker.pid");
+}
+function writeWorkerPidfile(): void {
+  try {
+    const p = workerPidfilePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, `${process.pid}\n`, { encoding: "utf-8" });
+  } catch {
+    // best-effort; stop still has the engine pidfile + port scan fallback
+  }
+}
+function clearWorkerPidfile(): void {
+  try {
+    unlinkSync(workerPidfilePath());
+  } catch {}
+}
 
 function hasGetMeter(
   sdk: unknown,
@@ -130,6 +157,10 @@ process.on("unhandledRejection", (reason) => {
 });
 
 async function main() {
+  // Fold ~/.agentmemory/.env into process.env before anything reads config
+  // or raw process.env. Only-if-unset, so real process.env still wins.
+  hydrateProcessEnvFromFile();
+
   const config = loadConfig();
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
@@ -186,6 +217,8 @@ async function main() {
     },
   });
 
+  writeWorkerPidfile();
+
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const metricsStore = new MetricsStore(kv);
@@ -236,31 +269,32 @@ async function main() {
     );
   }
 
-  if (isGraphExtractionEnabled()) {
-    registerGraphFunction(sdk, kv, provider);
-    bootLog(`Knowledge graph: extraction enabled`);
-  }
+  registerGraphFunction(sdk, kv, provider);
+  registerGraphImportFunction(sdk, kv);
+  bootLog(
+    `Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`,
+  );
 
   registerConsolidationPipelineFunction(sdk, kv, provider);
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
   if (isAutoCompressEnabled()) {
     bootLog(
-      `WARNING: AGENTMEMORY_AUTO_COMPRESS=true — every PostToolUse observation will be sent to your LLM provider for compression. This spends API tokens proportional to your session tool-use frequency (see #138). Set AGENTMEMORY_AUTO_COMPRESS=false to disable.`,
+      `WARNING: AGENTMEMORY_AUTO_COMPRESS=true — every PostToolUse observation will be sent to your LLM provider for compression. This spends API tokens proportional to your session tool-use frequency. Set AGENTMEMORY_AUTO_COMPRESS=false to disable.`,
     );
   } else {
     bootLog(
-      `Auto-compress: OFF (default, #138) — observations indexed via zero-LLM synthetic compression. Set AGENTMEMORY_AUTO_COMPRESS=true to opt-in to LLM-powered summaries (uses your API key).`,
+      `Auto-compress: OFF (default) — observations indexed via zero-LLM synthetic compression. Set AGENTMEMORY_AUTO_COMPRESS=true to opt-in to LLM-powered summaries (uses your API key).`,
     );
   }
 
   if (isContextInjectionEnabled()) {
     bootLog(
-      `WARNING: AGENTMEMORY_INJECT_CONTEXT=true — the PreToolUse and SessionStart hooks will inject up to ~4000 chars of memory context into every tool turn. On Claude Pro this burns session tokens proportional to your tool-call frequency (see #143). Set AGENTMEMORY_INJECT_CONTEXT=false to disable.`,
+      `WARNING: AGENTMEMORY_INJECT_CONTEXT=true — the PreToolUse and SessionStart hooks will inject up to ~4000 chars of memory context into every tool turn. On Claude Pro this burns session tokens proportional to your tool-call frequency. Set AGENTMEMORY_INJECT_CONTEXT=false to disable.`,
     );
   } else {
     bootLog(
-      `Context injection: OFF (default, #143) — hooks capture observations but do not inject context into Claude Code's conversation. Set AGENTMEMORY_INJECT_CONTEXT=true to opt-in (warning: expect your Claude Pro allocation to drain faster).`,
+      `Context injection: OFF (default) — hooks capture observations but do not inject context into Claude Code's conversation. Set AGENTMEMORY_INJECT_CONTEXT=true to opt-in (warning: expect your Claude Pro allocation to drain faster).`,
     );
   }
 
@@ -317,6 +351,21 @@ async function main() {
   const snapshotConfig = loadSnapshotConfig();
   if (snapshotConfig.enabled) {
     registerSnapshotFunction(sdk, kv, snapshotConfig.dir);
+    // The boot line promised "every <interval>s" but nothing ever fired
+    // mem::snapshot-create. Drive it on a periodic timer (unref'd so it
+    // never keeps the process alive), mirroring the auto-forget timer.
+    // mem::snapshot-create serializes overlapping runs internally (git-lock
+    // safety), so the timer can stay a simple fire-and-forget tick.
+    const snapshotTimer = setInterval(() => {
+      sdk
+        .trigger({
+          function_id: "mem::snapshot-create",
+          payload: {},
+          action: TriggerAction.Void(),
+        })
+        .catch(() => {});
+    }, snapshotConfig.interval * 1000);
+    snapshotTimer.unref();
     bootLog(
       `Git snapshots: ${snapshotConfig.dir} (every ${snapshotConfig.interval}s)`,
     );
@@ -334,9 +383,11 @@ async function main() {
     graphWeight,
   );
 
-  registerSmartSearchFunction(sdk, kv, (query, limit) =>
-    hybridSearch.search(query, limit),
-  );
+  const hybridRanker = (query: string, limit: number) =>
+    hybridSearch.search(query, limit);
+  registerSmartSearchFunction(sdk, kv, hybridRanker);
+  setHybridRanker(hybridRanker);
+  registerRecentSearchesSweepFunction(sdk, kv);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
@@ -345,6 +396,11 @@ async function main() {
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
   const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
+  // Wire the persistence hook so delete paths can flush BM25/vector
+  // index mutations to disk. Without this, an in-memory remove can be
+  // lost across a hard process exit and the persisted snapshot
+  // restores the deleted entry at next boot.
+  setIndexPersistence(indexPersistence);
 
   const loaded = await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted index:`, err);
@@ -357,75 +413,16 @@ async function main() {
     );
   }
   if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
-    // Persisted vectors carry whatever dimension the provider had when
-    // they were written. If the active provider declares a different
-    // dimension — or if the on-disk index contains a mix of dimensions
-    // (legacy indexes written before the live-API guard in this PR) —
-    // restoring would silently corrupt search: cosineSimilarity returns
-    // 0 on cross-dim pairs, so affected observations stop matching
-    // anything and recall degrades without an error. Walk every stored
-    // vector instead of trusting the first; refuse to load if anything
-    // is off.
-    const activeDim = embeddingProvider?.dimensions ?? 0;
-    const { mismatches, seenDimensions } =
-      activeDim > 0
-        ? loaded.vector.validateDimensions(activeDim)
-        : { mismatches: [], seenDimensions: new Set<number>() };
-
-    if (mismatches.length > 0) {
-      const sample = mismatches
-        .slice(0, 5)
-        .map((m) => `${m.obsId} (dim=${m.dim})`)
-        .join(", ");
-      const distinct = Array.from(seenDimensions).sort((a, b) => a - b).join(", ");
-      const dropStale = isDropStaleIndexEnabled();
-      if (dropStale) {
-        console.warn(
-          `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
-            `${loaded.vector.size} vectors with the wrong dimension. Active ` +
-            `provider (${embeddingProvider?.name}) declares ${activeDim}; ` +
-            `dimensions seen on disk: ${distinct}. ` +
-            `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
-            `vectors. Live observations will rebuild the index over time.`,
-        );
-        // Persist the empty vector index back so subsequent starts don't
-        // trip the same guard. Without this, the KV still holds the stale
-        // payload, so removing AGENTMEMORY_DROP_STALE_INDEX from .env would
-        // crash-loop the server again on the next boot.
-        await indexPersistence.save().catch((err) => {
-          console.warn(
-            `[agentmemory] Failed to persist cleared vector index:`,
-            err,
-          );
-        });
-      } else {
-        const envExists = RESOLVED_PATHS.envFileExists();
-        throw new Error(
-          `[agentmemory] Refusing to start: persisted vector index has ` +
-            `${mismatches.length} of ${loaded.vector.size} vectors with the ` +
-            `wrong dimension. Active provider (${embeddingProvider?.name}) ` +
-            `declares ${activeDim}; dimensions seen on disk: ${distinct}. ` +
-            `First mismatched obsIds: ${sample}. Loading would silently corrupt ` +
-            `search (cross-dimension cosine returns 0).\n` +
-            `\n` +
-            `Resolved paths:\n` +
-            `  data dir: ${RESOLVED_PATHS.dataDir}\n` +
-            `  env file: ${RESOLVED_PATHS.envFile} (exists: ${envExists})\n` +
-            `\n` +
-            `Recovery — pick ONE:\n` +
-            `  1. One-shot drop + rebuild (recommended):\n` +
-            `       echo 'AGENTMEMORY_DROP_STALE_INDEX=true' >> ${RESOLVED_PATHS.envFile}\n` +
-            `       # restart agentmemory; the flag can be removed after the next clean boot.\n` +
-            `  2. Re-embed the existing index against the new provider, then start.\n` +
-            `  3. Switch the embedding provider back to the one that wrote the index.\n` +
-            `\n` +
-            `If running under a service manager (LaunchAgent, systemd, Docker), confirm\n` +
-            `HOME points at the user account that owns ${RESOLVED_PATHS.dataDir} —\n` +
-            `the .env file above is what the running process actually reads.`,
-        );
-      }
-    } else {
-      vectorIndex.restoreFrom(loaded.vector);
+    const recovery = await recoverPersistedVectorIndex({
+      persistedIndex: loaded.vector,
+      activeIndex: vectorIndex,
+      expectedDimensions: embeddingProvider.dimensions,
+      providerName: embeddingProvider.name,
+      dropStale: isDropStaleIndexEnabled(),
+      persistence: indexPersistence,
+      paths: RESOLVED_PATHS,
+    });
+    if (recovery === "restored") {
       bootLog(
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
       );
@@ -470,7 +467,7 @@ async function main() {
         if (bm25Index.has(memory.id)) continue;
         bm25Index.add({
           id: memory.id,
-          sessionId: memory.sessionIds[0] ?? "memory",
+          sessionId: memory.sessionIds?.[0] ?? "memory",
           timestamp: memory.createdAt,
           type: "decision",
           title: memory.title,
@@ -484,7 +481,7 @@ async function main() {
       }
       if (backfilled > 0) {
         bootLog(
-          `Backfilled ${backfilled} memories into BM25 (legacy gap before #257)`,
+          `Backfilled ${backfilled} memories into BM25 (legacy index gap)`,
         );
         indexPersistence.scheduleSave();
       }
@@ -504,15 +501,14 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 124 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
 
-  const viewerPort = config.restPort + 2;
   const viewerServer = startViewerServer(
-    viewerPort,
+    config.viewerPort,
     kv,
     sdk,
     secret,
@@ -551,6 +547,20 @@ async function main() {
     insightDecayTimer.unref();
   }
 
+  // #771: hourly TTL sweep for the followup-rate diagnostic. The
+  // recent-searches scope only needs the last entry per session;
+  // sweeping anything older than the retention window keeps the scope
+  // from growing unbounded across long-lived deployments.
+  const recentSearchesSweepTimer = setInterval(async () => {
+    try {
+      await sdk.trigger({
+        function_id: "mem::diagnostic::recent-searches-sweep",
+        payload: {},
+      });
+    } catch {}
+  }, 60 * 60 * 1000);
+  recentSearchesSweepTimer.unref();
+
   if (isConsolidationEnabled()) {
     const consolidationTimer = setInterval(async () => {
       try {
@@ -571,6 +581,7 @@ async function main() {
       console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
     });
     await sdk.shutdown();
+    clearWorkerPidfile();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

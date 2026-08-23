@@ -63,6 +63,7 @@ function stripExistingBlock(toml: string): string {
 export const adapter: ConnectAdapter = {
   name: "codex",
   displayName: "Codex CLI",
+  category: "native",
   docs: "https://github.com/rohitg00/agentmemory#codex-cli-codex-plugin-platform",
   protocolNote:
     "→ Using MCP. Hooks ship via the Codex plugin; on Codex Desktop, also pass --with-hooks to install the global hooks.json workaround for openai/codex#16430.",
@@ -112,7 +113,7 @@ export const adapter: ConnectAdapter = {
 
     logInstalled("Codex CLI", CODEX_TOML);
     p.log.info(
-      "Codex picks up MCP servers on next launch. For the deeper plugin install, run: codex plugin marketplace add rohitg00/agentmemory && codex plugin install agentmemory",
+      "Codex picks up MCP servers on next launch. For the deeper plugin install, run: codex plugin marketplace add rohitg00/agentmemory && codex plugin add agentmemory@agentmemory",
     );
 
     if (opts.withHooks) {
@@ -168,8 +169,11 @@ function installCodexHooks(opts: ConnectOptions): ConnectResult {
   writeJsonAtomic(CODEX_HOOKS, merged);
 
   logInstalled("Codex hooks (workaround for openai/codex#16430)", CODEX_HOOKS);
+  p.log.warn(
+    "Codex runs only trusted hooks: launch `codex` (the TUI) once and choose \"Trust all and continue\" at the \"Hooks need review\" prompt. `codex exec` never shows the prompt, so hooks stay inert until then.",
+  );
   p.log.info(
-    "User-scope hooks reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect codex --with-hooks` after upgrading agentmemory to refresh them.",
+    "User-scope hooks reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect codex --with-hooks` after upgrading agentmemory to refresh them, then re-approve in the TUI.",
   );
 
   return {
