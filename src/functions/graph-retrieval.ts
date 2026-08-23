@@ -2,14 +2,8 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../types.js";
-import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
-import {
-  GraphIndexReader,
-  graphIndexesReady,
-  loadNameCatalog,
-  loadNodeIdsForObservations,
-} from "../state/graph-indexes.js";
+import { GraphIndexReader } from "../state/graph-indexes.js";
 
 export interface GraphRetrievalResult {
   obsId: string;
@@ -48,31 +42,6 @@ function buildGraphContext(
   return parts.join(" ");
 }
 
-function neighborsFromArrays(
-  allNodes: GraphNode[],
-  allEdges: GraphEdge[],
-): NeighborProvider {
-  const nodeIndex = new Map<string, GraphNode>();
-  for (const n of allNodes) nodeIndex.set(n.id, n);
-
-  const adjacency = new Map<
-    string,
-    Array<{ node: GraphNode; edge: GraphEdge }>
-  >();
-  const append = (from: string, to: string, edge: GraphEdge): void => {
-    const node = nodeIndex.get(to);
-    if (!node) return;
-    if (!adjacency.has(from)) adjacency.set(from, []);
-    adjacency.get(from)!.push({ node, edge });
-  };
-  for (const edge of allEdges) {
-    append(edge.sourceNodeId, edge.targetNodeId, edge);
-    append(edge.targetNodeId, edge.sourceNodeId, edge);
-  }
-
-  return async (nodeId) => adjacency.get(nodeId) ?? [];
-}
-
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
@@ -81,46 +50,28 @@ export class GraphRetrieval {
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    if (await graphIndexesReady(this.kv)) {
-      const reader = await GraphIndexReader.open(this.kv);
-      const catalog = await loadNameCatalog(this.kv);
-      const lowered = entityNames.map((e) => e.toLowerCase());
-      const matchingNodes: GraphNode[] = [];
-      for (const entry of catalog) {
-        const nameLower = entry.name.toLowerCase();
-        const matched = lowered.some(
-          (e) => nameLower.includes(e) || e.includes(nameLower),
-        );
-        if (!matched) continue;
-        const node = await reader.getNode(entry.id);
-        if (node) matchingNodes.push(node);
-      }
-      return this.scoreEntityMatches(
-        matchingNodes,
-        (id) => reader.getNeighbors(id),
-        maxDepth,
-        maxResults,
+    const reader = await GraphIndexReader.open(this.kv);
+    if (!reader) return [];
+    const catalog = await reader.getNameCatalog();
+    const lowered = entityNames.map((e) => e.toLowerCase());
+    const matchingNodes: GraphNode[] = [];
+    for (const entry of catalog) {
+      const nameLower = entry.name.toLowerCase();
+      const matched = lowered.some(
+        (e) => nameLower.includes(e) || e.includes(nameLower),
       );
+      if (!matched) continue;
+      const node = await reader.getNode(entry.id);
+      if (node) matchingNodes.push(node);
     }
 
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
-
-    const matchingNodes = allNodes.filter((n) => {
-      const nameLower = n.name.toLowerCase();
-      return entityNames.some(
-        (e) =>
-          nameLower.includes(e.toLowerCase()) ||
-          e.toLowerCase().includes(nameLower),
-      );
-    });
-
-    return this.scoreEntityMatches(
+    const results = await this.scoreEntityMatches(
       matchingNodes,
-      neighborsFromArrays(allNodes, allEdges),
+      (id) => reader.getNeighbors(id),
       maxDepth,
       maxResults,
     );
+    return (await reader.isCurrent()) ? results : [];
   }
 
   private async scoreEntityMatches(
@@ -132,8 +83,7 @@ export class GraphRetrieval {
     if (matchingNodes.length === 0) return [];
 
     // Which start node first claims an observation decides its score,
-    // so iterate in a deterministic order regardless of whether the
-    // matches came from enumeration or the sharded name catalog.
+    // so iterate catalog matches in a deterministic order.
     const orderedMatches = [...matchingNodes].sort((a, b) =>
       a.id.localeCompare(b.id),
     );
@@ -196,42 +146,28 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    if (await graphIndexesReady(this.kv)) {
-      const reader = await GraphIndexReader.open(this.kv);
-      const candidateIds = await loadNodeIdsForObservations(this.kv, obsIds);
-      const linkedNodes: GraphNode[] = [];
-      for (const nodeId of candidateIds) {
-        const node = await reader.getNode(nodeId);
-        if (
-          node &&
-          (node.sourceObservationIds ?? []).some((id) => obsIds.includes(id))
-        ) {
-          linkedNodes.push(node);
-        }
+    const reader = await GraphIndexReader.open(this.kv);
+    if (!reader) return [];
+    const candidateIds = await reader.getNodeIdsForObservations(obsIds);
+    const linkedNodes: GraphNode[] = [];
+    for (const nodeId of candidateIds) {
+      const node = await reader.getNode(nodeId);
+      if (
+        node &&
+        (node.sourceObservationIds ?? []).some((id) => obsIds.includes(id))
+      ) {
+        linkedNodes.push(node);
       }
-      return this.scoreExpansion(
-        linkedNodes,
-        (id) => reader.getNeighbors(id),
-        obsIds,
-        maxDepth,
-        maxResults,
-      );
     }
 
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
-
-    const linkedNodes = allNodes.filter((n) =>
-      n.sourceObservationIds.some((id) => obsIds.includes(id)),
-    );
-
-    return this.scoreExpansion(
+    const results = await this.scoreExpansion(
       linkedNodes,
-      neighborsFromArrays(allNodes, allEdges),
+      (id) => reader.getNeighbors(id),
       obsIds,
       maxDepth,
       maxResults,
     );
+    return (await reader.isCurrent()) ? results : [];
   }
 
   private async scoreExpansion(
@@ -282,37 +218,26 @@ export class GraphRetrieval {
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    if (await graphIndexesReady(this.kv)) {
-      const reader = await GraphIndexReader.open(this.kv);
-      const catalog = await loadNameCatalog(this.kv);
-      const lower = entityName.toLowerCase();
-      let entity: GraphNode | null = null;
-      for (const entry of catalog) {
-        if (entry.name.toLowerCase() !== lower) continue;
-        const node = await reader.getNode(entry.id);
-        if (node) {
-          entity = node;
-          break;
-        }
+    const reader = await GraphIndexReader.open(this.kv);
+    if (!reader) return { entity: null, currentState: [], history: [] };
+    const catalog = await reader.getNameCatalog();
+    const lower = entityName.toLowerCase();
+    let entity: GraphNode | null = null;
+    for (const entry of catalog) {
+      if (entry.name.toLowerCase() !== lower) continue;
+      const node = await reader.getNode(entry.id);
+      if (node) {
+        entity = node;
+        break;
       }
-      if (!entity) return { entity: null, currentState: [], history: [] };
-
-      const relatedEdges = await reader.getIncidentEdges(entity.id);
-      return this.partitionTemporalEdges(entity, relatedEdges, asOf);
     }
-
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
-
-    const entity = allNodes.find(
-      (n) => n.name.toLowerCase() === entityName.toLowerCase(),
-    );
     if (!entity) return { entity: null, currentState: [], history: [] };
 
-    const relatedEdges = allEdges.filter(
-      (e) => e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-    );
+    const relatedEdges = await reader.getIncidentEdges(entity.id);
 
+    if (!(await reader.isCurrent())) {
+      return { entity: null, currentState: [], history: [] };
+    }
     return this.partitionTemporalEdges(entity, relatedEdges, asOf);
   }
 
@@ -382,10 +307,8 @@ export class GraphRetrieval {
   // attached to every graph edge. Dijkstra over `cost = 1/weight`
   // (cheaper edges = stronger relationships) returns the
   // highest-weighted path to each reachable node within maxDepth.
-  // Neighbor expansion is delegated to the provider so the same
-  // traversal serves both the enumeration fallback (prebuilt adjacency
-  // over kv.list arrays) and the side-index path (targeted adjacency
-  // gets bounded by degree x maxDepth).
+  // Neighbor expansion is delegated to targeted adjacency reads bounded by
+  // degree x maxDepth.
   private async dijkstraTraversal(
     startNode: GraphNode,
     getNeighbors: NeighborProvider,

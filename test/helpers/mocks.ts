@@ -5,8 +5,20 @@ type Handler = (data: unknown) => Promise<unknown>;
 export function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
+    store,
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
+    },
+    update: async (
+      scope: string,
+      key: string,
+      updates: Array<{ path: string; value: unknown }>,
+    ): Promise<void> => {
+      const entries = store.get(scope);
+      if (!entries) return;
+      const value = (entries.get(key) as Record<string, unknown>) ?? {};
+      for (const u of updates) value[u.path] = u.value;
+      entries.set(key, value);
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
@@ -20,12 +32,18 @@ export function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    listGroups: async (): Promise<string[]> =>
+      [...store.entries()]
+        .filter(([, entries]) => entries.size > 0)
+        .map(([scope]) => scope),
   };
 }
 
-export function mockSdk() {
+export function mockSdk(opts?: { looseTrigger?: boolean }) {
   const functions = new Map<string, Handler>();
+  const looseTrigger = opts?.looseTrigger ?? false;
   return {
+    fns: functions,
     registerFunction: (
       idOrOpts: string | { id: string },
       handler: Handler,
@@ -46,7 +64,13 @@ export function mockSdk() {
       const payload =
         typeof idOrInput === "string" ? data : (idOrInput.payload as unknown);
       const fn = functions.get(id);
-      if (!fn) throw new Error(`No function: ${id}`);
+      if (!fn) {
+        // looseTrigger mirrors production fan-out where side-effect
+        // triggers (cascade, events) may target functions another
+        // module registers; tests exercising one module opt in.
+        if (looseTrigger) return null;
+        throw new Error(`No function: ${id}`);
+      }
       return fn(payload);
     },
   };

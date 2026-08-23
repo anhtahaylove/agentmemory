@@ -5,8 +5,6 @@ import type {
   SessionSummary,
   Memory,
   Session,
-  GraphNode,
-  GraphEdge,
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
@@ -186,6 +184,10 @@ export function registerMcpEndpoints(
               typeof args.project === "string" && args.project.trim().length > 0
                 ? args.project.trim()
                 : undefined;
+            const saveAgentId =
+              typeof args.agentId === "string" && args.agentId.trim().length > 0
+                ? (args.agentId as string).trim()
+                : undefined;
 
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
@@ -193,6 +195,7 @@ export function registerMcpEndpoints(
               concepts,
               files,
               ...(project !== undefined && { project }),
+              ...(saveAgentId !== undefined && { agentId: saveAgentId }),
             } });
             return {
               status_code: 200,
@@ -1122,6 +1125,16 @@ export function registerMcpEndpoints(
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonRecallResult, null, 2) }] } };
           }
 
+          case "memory_lesson_delete": {
+            if (typeof args.lessonId !== "string" || !args.lessonId.trim()) {
+              return { status_code: 400, body: { error: "lessonId is required" } };
+            }
+            const lessonDeleteResult = await sdk.trigger({ function_id: "mem::lesson-delete", payload: {
+              lessonId: args.lessonId.trim(),
+            } });
+            return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonDeleteResult, null, 2) }] } };
+          }
+
           case "memory_reflect": {
             const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
               project: args.project,
@@ -1464,14 +1477,10 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const nodes = await kv.list<GraphNode>(KV.graphNodes);
-            const edges = await kv.list<GraphEdge>(KV.graphEdges);
-            const nodesByType: Record<string, number> = {};
-            for (const n of nodes)
-              nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
-            const edgesByType: Record<string, number> = {};
-            for (const e of edges)
-              edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+            const stats = await sdk.trigger({
+              function_id: "mem::graph-stats",
+              payload: {},
+            });
             return {
               status_code: 200,
               body: {
@@ -1479,12 +1488,7 @@ export function registerMcpEndpoints(
                   {
                     uri,
                     mimeType: "application/json",
-                    text: JSON.stringify({
-                      totalNodes: nodes.length,
-                      totalEdges: edges.length,
-                      nodesByType,
-                      edgesByType,
-                    }),
+                    text: JSON.stringify(stats),
                   },
                 ],
               },
