@@ -183,6 +183,25 @@ describe("mcp::tools::call dispatch", () => {
     expect(payload.sessions.map((s) => s.id)).toEqual(["s2", "s3"]);
   });
 
+  it("memory_sessions clamps limit to an integer from 1 through 100", async () => {
+    for (let i = 0; i < 105; i++) {
+      const startedAt = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
+      await kv.set("mem:sessions", `s${i}`, makeSession(`s${i}`, startedAt));
+    }
+
+    const fn = sdk.getFunction("mcp::tools::call")!;
+    for (const [limit, expected] of [
+      [-3, 1],
+      [0, 1],
+      [2.9, 2],
+      [999, 100],
+    ] as const) {
+      const result = (await fn(makeCall("memory_sessions", { limit }))) as CallResult;
+      const payload = JSON.parse(result.body.content![0]!.text) as { sessions: Session[] };
+      expect(payload.sessions, `limit=${limit}`).toHaveLength(expected);
+    }
+  });
+
   it("memory_sessions defaults to 20 most recent sessions", async () => {
     for (let i = 0; i < 25; i++) {
       const day = String(i + 1).padStart(2, "0");

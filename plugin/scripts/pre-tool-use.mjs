@@ -23,6 +23,7 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const toolName = typeof data.tool_name === "string" ? data.tool_name : typeof data.toolName === "string" ? data.toolName : void 0;
 	if (!toolName) return;
@@ -55,7 +56,7 @@ async function main() {
 		const pattern = toolInput["pattern"];
 		if (typeof pattern === "string" && pattern.length > 0) terms.push(pattern);
 	}
-	const rawSessionId = data.session_id || data.sessionId;
+	const rawSessionId = data.session_id || data.sessionId || data.conversation_id;
 	const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : "unknown";
 	const project = typeof data.project === "string" && data.project.trim().length > 0 ? data.project.trim() : void 0;
 	try {
@@ -77,8 +78,8 @@ async function main() {
 		}
 	} catch {}
 }
-main();
-
+main().catch(() => process.exit(0));
 //#endregion
-export {  };
+export {};
+
 //# sourceMappingURL=pre-tool-use.mjs.map

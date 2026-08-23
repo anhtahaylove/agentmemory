@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
-
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -21,7 +20,16 @@ function resolveProject(cwd) {
 	} catch {}
 	return basename(dir);
 }
-
+function hookCwd(data) {
+	if (!data || typeof data !== "object") return void 0;
+	if (typeof data.cwd === "string" && data.cwd.trim()) return data.cwd;
+	const roots = data.workspace_roots;
+	if (Array.isArray(roots)) {
+		for (const root of roots) if (typeof root === "string" && root.trim()) return root;
+	}
+	const projectDir = process.env["DEVIN_PROJECT_DIR"] || process.env["CLAUDE_PROJECT_DIR"];
+	if (projectDir && projectDir.trim()) return projectDir;
+}
 //#endregion
 //#region src/hooks/pre-compact.ts
 function isSdkChildContext(payload) {
@@ -45,9 +53,10 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
-	const sessionId = data.session_id || data.sessionId || "unknown";
-	const project = resolveProject(data.cwd);
+	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
+	const project = resolveProject(hookCwd(data));
 	if (process.env["CLAUDE_MEMORY_BRIDGE"] === "true") try {
 		await fetch(`${REST_URL}/agentmemory/claude-bridge/sync`, {
 			method: "POST",
@@ -73,8 +82,8 @@ async function main() {
 		}
 	} catch {}
 }
-main();
-
+main().catch(() => process.exit(0));
 //#endregion
-export {  };
+export {};
+
 //# sourceMappingURL=pre-compact.mjs.map

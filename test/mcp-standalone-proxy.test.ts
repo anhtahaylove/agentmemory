@@ -53,7 +53,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(calls.find((c) => c.url.includes("/sessions"))).toBeDefined();
   });
 
-  it("forwards project on memory_save to /agentmemory/remember", async () => {
+  it("forwards trimmed project and agentId on memory_save", async () => {
     let rememberBody: Record<string, unknown> | undefined;
     installFetch((url, init) => {
       if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
@@ -66,10 +66,12 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
 
     await handleToolCall("memory_save", {
       content: "scoped memory",
-      project: "my-project",
+      project: " my-project ",
+      agentId: " codex-1 ",
     });
 
     expect(rememberBody?.project).toBe("my-project");
+    expect(rememberBody?.agentId).toBe("codex-1");
   });
 
   it("proxies memory_smart_search to POST /agentmemory/smart-search", async () => {
