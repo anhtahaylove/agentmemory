@@ -31,21 +31,16 @@ async function main() {
     return;
   }
 
+  if (!data || typeof data !== "object") return;
   if (isSdkChildContext(data)) {
     // Do not summarize from inside a Claude Agent SDK child session;
     // would re-enter agent-sdk provider and loop (see sdk-guard.ts).
     return;
   }
 
-  const sessionId = ((data.session_id || data.sessionId) as string) || "unknown";
+  const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
 
-  fetch(`${REST_URL}/agentmemory/summarize`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({ sessionId }),
-    signal: AbortSignal.timeout(120000),
-  }).catch(() => {});
-
+  // session/end already fans out the summary server-side (#1203).
   fetch(`${REST_URL}/agentmemory/session/end`, {
     method: "POST",
     headers: authHeaders(),
@@ -56,4 +51,4 @@ async function main() {
   setTimeout(() => process.exit(0), 1500).unref();
 }
 
-main();
+main().catch(() => process.exit(0));

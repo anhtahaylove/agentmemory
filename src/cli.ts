@@ -22,6 +22,22 @@ import { join, dirname, delimiter as PATH_DELIMITER } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, platform } from "node:os";
 import * as p from "@clack/prompts";
+import pc from "picocolors";
+
+// Semantic color helpers. clack strips ANSI for box-width math
+// (stripVTControlCharacters + string-width), so coloring inside p.note
+// keeps borders aligned. Centralized here so the palette stays consistent
+// across every command's output.
+const c = {
+  url: pc.cyan,
+  ok: pc.green,
+  warn: pc.yellow,
+  err: pc.red,
+  cmd: (s: string) => pc.bold(pc.cyan(s)),
+  label: pc.bold,
+  dim: pc.dim,
+  accent: (s: string) => pc.bold(pc.yellow(s)),
+};
 import { generateId } from "./state/schema.js";
 import {
   buildDiagnostics,
@@ -50,11 +66,14 @@ import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
 import { setBootVerbose } from "./logger.js";
+import { hydrateProcessEnvFromFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
+import { knownAgents } from "./cli/connect/index.js";
 
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
+import { resolveDataDir } from "./cli-data-dir.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -72,6 +91,12 @@ const IS_VERBOSE =
 setBootVerbose(IS_VERBOSE);
 
 const IS_RESET = args.includes("--reset");
+
+// Fold ~/.agentmemory/.env into process.env before any port/URL read
+// (getRestPort/getBaseUrl/getStreamPort/getEnginePort) or the --port /
+// --instance / --tools handlers below. Only-if-unset, so a real
+// process.env value — including one just set by a CLI flag — still wins.
+hydrateProcessEnvFromFile();
 
 // --version / -V early exit. Print VERSION + exit before any side effects
 // (engine boot, env load, dir mkdir). `-v` is taken by --verbose so we
@@ -128,6 +153,22 @@ function vlog(msg: string): void {
   if (IS_VERBOSE) p.log.info(`[verbose] ${msg}`);
 }
 
+function wrapList(items: readonly string[], indent: number, width = 78): string {
+  const lines: string[] = [];
+  let line = "";
+  for (const item of items) {
+    const joined = line ? `${line}, ${item}` : item;
+    if (line && indent + joined.length > width) {
+      lines.push(`${line},`);
+      line = item;
+    } else {
+      line = joined;
+    }
+  }
+  lines.push(line);
+  return lines.join(`\n${" ".repeat(indent)}`);
+}
+
 if (args.includes("--help") || args.includes("-h")) {
   console.log(`
 agentmemory — persistent memory for AI coding agents
@@ -137,9 +178,8 @@ Usage: agentmemory [command] [options]
 Commands:
   (default)          Start agentmemory worker
   init               Copy bundled .env.example to ~/.agentmemory/.env if absent
-  connect [agent]    Wire agentmemory into an installed agent (claude-code,
-                     copilot-cli, codex, cursor, gemini-cli, openclaw,
-                     hermes, pi, openhuman).
+  connect [agent]    Wire agentmemory into an installed agent
+                     (${wrapList(knownAgents(), 21)}).
                      No arg = interactive picker. --all wires every detected agent.
                      --dry-run shows what would change. --force re-installs.
   status             Show connection status, memory count, flags, and health
@@ -174,10 +214,12 @@ Options:
   --instance <N>     Shortcut for --port (3111 + N*100) to run multiple
                      daemons side-by-side without env gymnastics.
                      --instance 1 -> 3211/3212/3213/49234, etc. (max N=50)
+  --data-dir <path>  Store iii-engine state outside the current repo
 
 Environment:
   AGENTMEMORY_URL              Full REST base URL (e.g. http://localhost:3111).
                                Honored by status, doctor, and MCP shim commands.
+  AGENTMEMORY_DATA_DIR         State directory fallback when --data-dir is not set.
   AGENTMEMORY_USE_DOCKER=1     Prefer the bundled docker-compose path over the
                                native iii-engine binary on first run.
   AGENTMEMORY_III_VERSION      Override pinned iii-engine version (default ${IIPINNED_VERSION}).
@@ -199,7 +241,13 @@ Quick start:
 
 const toolsIdx = args.indexOf("--tools");
 if (toolsIdx !== -1 && args[toolsIdx + 1]) {
-  process.env["AGENTMEMORY_TOOLS"] = args[toolsIdx + 1];
+  const toolsMode = args[toolsIdx + 1]!;
+  if (toolsMode !== "all" && toolsMode !== "core") {
+    p.log.warn(
+      `Unknown --tools value "${toolsMode}" (valid: all, core); falling back to all.`,
+    );
+  }
+  process.env["AGENTMEMORY_TOOLS"] = toolsMode;
 }
 
 const portIdx = args.indexOf("--port");
@@ -209,7 +257,7 @@ if (portIdx !== -1 && args[portIdx + 1]) {
 
 // `--instance N` picks a 100-port block off the 3111 base so multiple
 // agentmemory daemons can coexist on one host without env-var
-// gymnastics (#750). `--instance 0` keeps the canonical 3111/3112/3113/49134
+// gymnastics. `--instance 0` keeps the canonical 3111/3112/3113/49134
 // quartet; `--instance 1` → 3211/3212/3213/49234; etc. REST acts as the
 // anchor — streams/viewer/engine derive from it via fixed offsets below
 // unless an env explicitly pins each one.
@@ -222,6 +270,11 @@ if (instanceIdx !== -1 && args[instanceIdx + 1]) {
       process.env["III_REST_PORT"] = String(base);
     }
   }
+}
+
+const dataDirResolution = resolveDataDir({ args });
+if (dataDirResolution.source !== "default") {
+  process.env["AGENTMEMORY_DATA_DIR"] = dataDirResolution.dataDir;
 }
 
 const skipEngine = args.includes("--no-engine");
@@ -292,7 +345,7 @@ function getViewerUrl(): string {
 // engine docs use post-0.11) and `III_STREAMS_PORT` (the name our
 // own config.ts has used since 0.7) so a single source of truth in
 // either form lights up the ready panel. Falls back to REST+1 so
-// `--port 3211` auto-picks 3212 instead of colliding on 3112 (#750).
+// `--port 3211` auto-picks 3212 instead of colliding on 3112.
 function getStreamPort(): number {
   return (
     parseInt(process.env["III_STREAM_PORT"] || "", 10) ||
@@ -304,7 +357,7 @@ function getStreamPort(): number {
 // Bridge WebSocket port — the iii engine's internal worker bus.
 // Defaults derived from REST as REST+46023 so the canonical 3111
 // anchor yields 49134 and `--port 3211` auto-picks 49234 without a
-// second-instance collision (#750). Overridable via
+// second-instance collision. Overridable via
 // `III_ENGINE_PORT` or the legacy `III_ENGINE_URL=ws://host:port`.
 function getEnginePort(): number {
   const explicit = parseInt(process.env["III_ENGINE_PORT"] || "", 10);
@@ -356,7 +409,7 @@ function findIiiConfig(): string {
   // Precedence (user-overridable wins): explicit env > project cwd >
   // ~/.agentmemory/ > bundled. The bundled config used to win
   // unconditionally, so users hitting the observability log-feedback
-  // loop (#519) had no way to drop a tamer config in place without
+  // loop had no way to drop a tamer config in place without
   // editing node_modules.
   const envPath = process.env["AGENTMEMORY_III_CONFIG"];
   const candidates = [
@@ -370,6 +423,50 @@ function findIiiConfig(): string {
     if (existsSync(c)) return c;
   }
   return "";
+}
+
+function yamlSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function renderIiiConfig(template: string, dataDir: string): string {
+  return template
+    .replace(
+      "file_path: ./data/state_store.db",
+      `file_path: ${yamlSingleQuoted(join(dataDir, "state_store.db"))}`,
+    )
+    .replace(
+      "file_path: ./data/stream_store",
+      `file_path: ${yamlSingleQuoted(join(dataDir, "stream_store"))}`,
+    );
+}
+
+function writeRuntimeIiiConfig(configPath: string, dataDir: string): string {
+  mkdirSync(dataDir, { recursive: true });
+  const runtimeConfigPath = join(dataDir, "iii-config.yaml");
+  writeFileSync(
+    runtimeConfigPath,
+    renderIiiConfig(readFileSync(configPath, "utf8"), dataDir),
+  );
+  return runtimeConfigPath;
+}
+
+function warnIfRelocatedDataDir(): void {
+  if (!dataDirResolution.relocatedFrom) return;
+
+  try {
+    mkdirSync(dataDirResolution.dataDir, { recursive: true });
+    const marker = join(dataDirResolution.dataDir, ".cwd-relocation-warning");
+    if (existsSync(marker)) return;
+    p.log.warn(
+      `Default data dir ${dataDirResolution.relocatedFrom} is inside a git worktree; using ${dataDirResolution.dataDir} instead.`,
+    );
+    writeFileSync(marker, new Date().toISOString());
+  } catch {
+    p.log.warn(
+      `Default data dir ${dataDirResolution.relocatedFrom} is inside a git worktree; using ${dataDirResolution.dataDir} instead.`,
+    );
+  }
 }
 
 function whichBinary(name: string): string | null {
@@ -391,7 +488,7 @@ function whichBinary(name: string): string | null {
 
 // Private install location agentmemory manages itself. Sits under the
 // agentmemory state dir (~/.agentmemory/bin) so the pinned engine stays
-// isolated from a user-managed iii on PATH or in ~/.local/bin. #752: a
+// isolated from a user-managed iii on PATH or in ~/.local/bin. A
 // fresh box with iii 0.16.1 already on PATH refused to boot because the
 // hard-pin enforcer told users to overwrite their global install with
 // v0.11.2. Private install resolves the conflict without touching their
@@ -516,7 +613,7 @@ function clearEnginePidfile(): void {
   } catch {}
 }
 
-// Worker pidfile (#640, #474): the agentmemory worker process
+// Worker pidfile: the agentmemory worker process
 // (`node dist/index.mjs`) is spawned by iii-exec inside the engine. When
 // `agentmemory stop` kills only the engine pid, the worker can survive
 // (detached spawn, signal not propagated, or kept alive by a wrapper
@@ -671,7 +768,7 @@ function detectIiiConsole(): IiiConsoleState {
 // install.iii.dev/iii/main/install.sh: `engine_version="${VERSION:-}"`).
 // Pin to IIPINNED_VERSION so a fresh boot can never pull a newer iii
 // console that talks a different protocol than our pinned engine
-// (root cause of #712-class drift).
+// (root cause of protocol drift).
 const III_CONSOLE_INSTALL_CMD =
   `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
 
@@ -741,6 +838,18 @@ function adoptRunningEngine(): void {
 
     const pids = findEnginePidsByPort(getRestPort());
     const enginePid = pids[0];
+    if (enginePid) {
+      // A Docker-forwarded port is held by the VM/proxy process
+      // (com.docker.backend, vpnkit, ...), not the engine. Adopting it
+      // as kind:"native" would make a later `stop` SIGTERM that process.
+      const comm = pidCommand(enginePid);
+      if (isForeignPortHolder(comm)) {
+        vlog(
+          `adoptRunningEngine: refusing to adopt pid ${enginePid} (${comm}) — not the iii engine binary`,
+        );
+        return;
+      }
+    }
     if (enginePid && !existingPid) {
       writeEnginePidfile(enginePid);
     }
@@ -752,7 +861,7 @@ function adoptRunningEngine(): void {
       });
     }
     if (enginePid && !existingPid) {
-      p.log.info(`Attached to existing iii-engine (pid ${enginePid})`);
+      p.log.info(c.ok(`Attached to existing iii-engine (pid ${enginePid})`));
     }
   } catch (err) {
     vlog(`adoptRunningEngine: ${err instanceof Error ? err.message : String(err)}`);
@@ -926,7 +1035,7 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
   const launch = prepareEngineLaunch(configPath);
   writeEngineState({ kind: "native", configPath: launch.configPath, binPath: iiiBin });
   spawnEngineBackground(iiiBin, ["--config", launch.configPath], "iii-engine", launch.cwd);
-  s.stop("iii-engine process started");
+  s.stop(c.ok("iii-engine process started"));
   return true;
 }
 
@@ -946,8 +1055,12 @@ function pickCompatibleIii(candidates: Array<string | null | undefined>): string
 
 async function startEngine(): Promise<boolean> {
   const configPath = findIiiConfig();
+  warnIfRelocatedDataDir();
+  const runtimeConfigPath = configPath
+    ? writeRuntimeIiiConfig(configPath, dataDirResolution.dataDir)
+    : "";
   const pathIii = whichBinary("iii");
-  vlog(`iii binary: ${pathIii ?? "(not on PATH)"}, config: ${configPath || "(not found)"}`);
+  vlog(`iii binary: ${pathIii ?? "(not on PATH)"}, config: ${runtimeConfigPath || "(not found)"}`);
 
   const fallbacks = fallbackIiiPaths().filter((p) => existsSync(p));
   for (const f of fallbacks) {
@@ -957,12 +1070,12 @@ async function startEngine(): Promise<boolean> {
 
   let iiiBin = pickCompatibleIii([pathIii, ...fallbacks]);
 
-  if (iiiBin && configPath) {
+  if (iiiBin && runtimeConfigPath) {
     if (iiiBin !== pathIii) {
-      p.log.info(`Using iii at: ${iiiBin} (v${IIPINNED_VERSION})`);
+      p.log.info(`Using iii at: ${c.dim(iiiBin)} (v${c.accent(IIPINNED_VERSION)})`);
       process.env["PATH"] = `${dirname(iiiBin)}${PATH_DELIMITER}${process.env["PATH"] ?? ""}`;
     }
-    return startIiiBin(iiiBin, configPath);
+    return startIiiBin(iiiBin, runtimeConfigPath);
   }
 
   if (pathIii && !iiiBin) {
@@ -980,6 +1093,7 @@ async function startEngine(): Promise<boolean> {
 
   const dockerBin = whichBinary("docker");
   vlog(`docker binary: ${dockerBin ?? "(not on PATH)"}`);
+  mkdirSync(dataDirResolution.dataDir, { recursive: true });
   const dockerComposeCandidates = [
     join(__dirname, "..", "docker-compose.yml"),
     join(__dirname, "docker-compose.yml"),
@@ -1185,20 +1299,20 @@ function printReadyHint(consoleState: IiiConsoleState): void {
         // the detected binary path so `(run: ...)` is executable as-
         // is, even when the binary isn't on PATH under the bare
         // name `iii-console`.
-        `iii console  ${consoleState.binPath}  (run: ${consoleState.binPath} -p <port>)`
-      : `iii console  (install: ${iiiConsoleInstallHint()})`;
+        `${c.label("iii console")}  ${c.dim(consoleState.binPath)}  ${c.dim(`(run: ${consoleState.binPath} -p <port>)`)}`
+      : `${c.label("iii console")}  ${c.dim(`(install: ${iiiConsoleInstallHint()})`)}`;
 
   const lines = [
-    `REST API     ${restUrl}`,
-    `Viewer       ${viewerUrl}`,
-    `Streams      ${streamUrl}`,
-    `Engine       ${engineUrl}`,
+    `${c.label("REST API")}     ${c.url(restUrl)}`,
+    `${c.label("Viewer")}       ${c.url(viewerUrl)}`,
+    `${c.label("Streams")}      ${c.url(streamUrl)}`,
+    `${c.label("Engine")}       ${c.url(engineUrl)}`,
     consoleLine,
   ];
   // p.note renders a bordered panel with a title — same affordance
   // used elsewhere in this CLI for "Troubleshooting" / "Setup
   // required" blocks, so the visual language stays consistent.
-  p.note(lines.join("\n"), `agentmemory v${VERSION}`);
+  p.note(lines.join("\n"), `agentmemory v${c.accent(VERSION)}`);
 
   // Pick a runnable form for the suggested next-step. Users invoked
   // via `npx` don't have the bare `agentmemory` command on PATH yet
@@ -1208,10 +1322,30 @@ function printReadyHint(consoleState: IiiConsoleState): void {
   const demoCommand = isInvokedViaNpx()
     ? "npx @agentmemory/agentmemory demo"
     : "agentmemory demo";
-  process.stdout.write(`\nTry: ${demoCommand}\n`);
+  process.stdout.write(`\n${c.dim("Try:")} ${c.cmd(demoCommand)}\n`);
 }
 
 async function main() {
+  // Booting a second instance next to a live daemon registers a duplicate
+  // worker on the running engine, and on iii 0.11.2 the second instance's
+  // shutdown tears down the daemon's HTTP trigger routing (every
+  // /agentmemory/* route 404s until a full engine restart). Refuse instead.
+  // A different --instance resolves to a different port, so multi-instance
+  // setups are unaffected.
+  try {
+    const probe = await fetch(`${getBaseUrl()}/agentmemory/livez`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (probe.ok) {
+      p.log.error(
+        `agentmemory is already running on port ${getRestPort()}. Starting a second instance here would corrupt the running daemon's REST routing. Use the REST API (or the MCP tools) against the running instance, run a different --instance, or stop it first with \`agentmemory stop\`.`,
+      );
+      process.exit(1);
+    }
+  } catch {
+    // no live daemon on this port; boot normally
+  }
+
   // `--reset` wipes preferences before anything else so the onboarding
   // flow below always runs fresh.
   if (IS_RESET) {
@@ -1259,24 +1393,58 @@ async function main() {
       whichBinary("iii") ??
       fallbackIiiPaths().find((p) => existsSync(p)) ??
       null;
-    if (attachedBin) {
-      const detected = iiiBinVersion(attachedBin);
-      if (detected && detected !== IIPINNED_VERSION) {
-        p.log.warn(
-          `iii on PATH is v${detected} (from ${attachedBin}) but agentmemory v${VERSION} pins v${IIPINNED_VERSION}. ` +
-            `agentmemory will use its own pinned engine in ~/.agentmemory/bin and leaves ${attachedBin} untouched. ` +
-            `If you want agentmemory to track a different engine, set AGENTMEMORY_III_VERSION=${detected}.`,
-        );
+    const detected = attachedBin ? iiiBinVersion(attachedBin) : null;
+
+    // Fail closed: only adopt the running engine when we can positively
+    // confirm it is the pinned version. An unknown version (detected === null,
+    // e.g. the binary can't be version-probed) is treated as incompatible —
+    // adopting a foreign or unverifiable engine hangs the worker in a
+    // WebSocket reconnect loop. Worst case here is a re-run that reinstalls
+    // the pinned engine, never a silent loop.
+    if (detected === IIPINNED_VERSION) {
+      adoptRunningEngine();
+      await import("./index.js");
+      if (await waitForAgentmemoryReady(15000)) {
+        const consoleState = await ensureIiiConsole();
+        await maybeOfferGlobalInstall();
+        printReadyHint(consoleState);
       }
+      return;
     }
-    adoptRunningEngine();
-    await import("./index.js");
-    if (await waitForAgentmemoryReady(15000)) {
-      const consoleState = await ensureIiiConsole();
-      await maybeOfferGlobalInstall();
-      printReadyHint(consoleState);
-    }
-    return;
+
+    const detectedLabel = detected ? `v${detected}` : "an unverified version";
+
+    // An incompatible engine owns the port. Adopting it hangs the worker in a
+    // WebSocket reconnect loop (it can't speak that engine's protocol), so stop
+    // with the simplest honest remedy. A normal user has no other engine and
+    // never sees this; only someone running their own iii does, and for them
+    // "stop it, then run normally" is the fix. We do not suggest a different
+    // engine version: agentmemory only supports v${IIPINNED_VERSION}.
+    const base = isInvokedViaNpx() ? "npx @agentmemory/agentmemory" : "agentmemory";
+    p.log.error(
+      `Another iii-engine (${detectedLabel}) is running on port ${getEnginePort()}, and agentmemory needs its own pinned v${IIPINNED_VERSION}.`,
+    );
+    p.note(
+      [
+        `agentmemory only supports iii-engine v${IIPINNED_VERSION}. It will not adopt or change the running engine (${detectedLabel}).`,
+        "",
+        c.label("Switch to the pinned engine in two steps:"),
+        "",
+        `  1. Stop the running engine:`,
+        `       ${c.cmd(`${base} stop --force`)}`,
+        `     ${c.dim(`(or stop your own iii however you started it — agentmemory leaves your global iii untouched)`)}`,
+        "",
+        `  2. Start agentmemory. It downloads and runs the pinned`,
+        `     v${IIPINNED_VERSION} into ~/.agentmemory/bin automatically:`,
+        `       ${c.cmd(base)}`,
+        "",
+        c.dim(`Step 2 needs no manual install. To install iii v${IIPINNED_VERSION} yourself (replaces your global iii), curl:`),
+        `     ${c.cmd(III_CONSOLE_INSTALL_CMD)}`,
+        `     ${c.dim("or download the release:")} ${c.url(`https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`)}`,
+      ].join("\n"),
+      "engine conflict",
+    );
+    process.exit(1);
   }
 
   const started = await startEngine();
@@ -1342,7 +1510,7 @@ async function main() {
     process.exit(1);
   }
 
-  s.stop("iii-engine is ready");
+  s.stop(c.ok("iii-engine is ready"));
   await import("./index.js");
   if (await waitForAgentmemoryReady(15000)) {
     const consoleState = await ensureIiiConsole();
@@ -1418,7 +1586,7 @@ async function runStatus() {
     p.log.success(`Connected — v${version} at ${base}`);
 
     const lines = [
-      `Health:       ${status === "healthy" ? "✓ healthy" : status}`,
+      `Health:       ${status === "healthy" ? pc.green("✓ healthy") : pc.yellow(status)}`,
       `Sessions:     ${sessions}`,
       `Observations: ${obsCount}`,
       `Memories:     ${memCount}`,
@@ -1426,7 +1594,7 @@ async function runStatus() {
       `Circuit:      ${cb}`,
       `Heap:         ${heapMB} MB`,
       `Uptime:       ${uptime}s`,
-      `Viewer:       ${getViewerUrl()}`,
+      `Viewer:       ${c.url(getViewerUrl())}`,
     ];
 
     if (obsCount > 0) {
@@ -1437,10 +1605,10 @@ async function runStatus() {
     }
 
     if (flagsRes) {
-      const provider = flagsRes.provider === "llm" ? "✓ llm" : "✗ noop (no key)";
-      const embed = flagsRes.embeddingProvider === "embeddings" ? "✓ embeddings" : "bm25-only";
+      const provider = flagsRes.provider === "llm" ? pc.green("✓ llm") : pc.yellow("✗ noop (no key)");
+      const embed = flagsRes.embeddingProvider === "embeddings" ? pc.green("✓ embeddings") : pc.dim("bm25-only");
       const flagRows = (flagsRes.flags || []).map((f: { key: string; enabled: boolean; label: string }) =>
-        `  ${f.enabled ? "✓" : "✗"} ${f.key.padEnd(32)} ${f.label}`
+        `  ${f.enabled ? pc.green("✓") : pc.dim("✗")} ${pc.bold(f.key.padEnd(32))} ${f.label}`
       );
       lines.push("");
       lines.push(`Provider:     ${provider}`);
@@ -1470,7 +1638,7 @@ type DoctorCheck = { name: string; ok: boolean; hint?: string };
 
 function formatChecks(checks: DoctorCheck[]): string {
   return checks
-    .map((c) => `${c.ok ? "✓" : "✗"} ${c.name}${c.hint ? `\n   ${c.hint}` : ""}`)
+    .map((c) => `${c.ok ? pc.green("✓") : pc.red("✗")} ${c.name}${c.hint ? `\n   ${c.hint}` : ""}`)
     .join("\n");
 }
 
@@ -2266,21 +2434,35 @@ async function runDemoBody(base: string) {
 
   sQuery.stop("Search complete");
 
+  // Only claim the semantic-recall win when the search actually hit.
+  // Without an embedding key this query returns 0 hits, and asserting
+  // success over a visibly failed search reads as a lie.
+  const semanticHits =
+    results.find((r) => r.query === "database performance optimization")
+      ?.hits ?? 0;
   const lines = [
     `Project:       ${demoProject}`,
     `Sessions:      ${sessions.length} seeded (${totalObs} observations)`,
     "",
-    "Search results:",
+    c.label("Search results:"),
     ...results.flatMap((r) => [
-      `  "${r.query}"`,
-      `    → ${r.hits} hit(s), top: ${r.topTitle.slice(0, 60)}`,
+      `  ${c.label(`"${r.query}"`)}`,
+      `    ${c.dim("→")} ${c.ok(`${r.hits} hit(s)`)}, top: ${r.topTitle.slice(0, 60)}`,
     ]),
     "",
-    `Notice: searching "database performance optimization"`,
-    `found the N+1 query fix — keyword matching can't do that.`,
+    ...(semanticHits > 0
+      ? [
+          c.accent(`Notice: searching "database performance optimization"`),
+          c.accent(`found the N+1 query fix — keyword matching can't do that.`),
+        ]
+      : [
+          c.dim(`Note: "database performance optimization" found nothing —`),
+          c.dim(`semantic recall needs an embedding provider key (e.g.`),
+          c.dim(`OPENAI_API_KEY or GEMINI_API_KEY in ~/.agentmemory/.env).`),
+        ]),
     "",
-    `Viewer:        ${getViewerUrl()}`,
-    `Clean up with: curl -X DELETE "${base}/agentmemory/sessions?project=${demoProject}"`,
+    `Viewer:        ${c.url(getViewerUrl())}`,
+    `Clean up with: ${c.dim(`curl -X DELETE "${base}/agentmemory/sessions?project=${demoProject}"`)}`,
   ];
 
   p.note(lines.join("\n"), "demo complete");
@@ -2301,7 +2483,7 @@ function runCommand(
   });
 
   if (result.status === 0) {
-    spinner.stop(`${options.label} ✓`);
+    spinner.stop(`${options.label} ${pc.green("✓")}`);
     return true;
   }
 
@@ -2315,7 +2497,7 @@ function runCommand(
     return false;
   }
 
-  spinner.stop(`${options.label} ✗`);
+  spinner.stop(`${options.label} ${pc.red("✗")}`);
   p.log.error(msg.slice(0, 300));
   return false;
 }
@@ -2445,6 +2627,40 @@ async function signalAndWait(
   return !pidAlive(pid);
 }
 
+// Shared worker-reap: SIGTERM with a grace window sized for the worker's
+// shutdown flush (index snapshots land via the engine, so the worker must
+// die before the engine does, with time to commit).
+async function stopWorkerPid(pid: number, graceMs: number): Promise<boolean> {
+  const s = p.spinner();
+  s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
+  const ok = await signalAndWait(pid, "SIGTERM", graceMs);
+  s.stop(ok ? `Stopped worker pid ${pid}` : `Failed to stop worker pid ${pid}`);
+  return ok;
+}
+
+function pidCommand(pid: number): string {
+  if (IS_WINDOWS) return "";
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// Positive identity beats a denylist: the engine is always the `iii`
+// binary (spawned from PATH or ~/.agentmemory/bin), so anything else
+// holding the port — Docker's proxy, an ssh forward, a stray dev
+// server — must not be adopted or signaled. A denylist of known VM
+// stacks failed open for every name it didn't know.
+function isForeignPortHolder(comm: string): boolean {
+  if (!comm) return false;
+  const base = comm.split("/").pop() || comm;
+  return base !== "iii" && !base.startsWith("iii-");
+}
+
 function findEnginePidsByPort(port: number): number[] {
   if (IS_WINDOWS) return [];
   const lsof = whichBinary("lsof");
@@ -2484,15 +2700,52 @@ async function stopDockerEngine(composeFile: string, port: number): Promise<void
     );
     process.exit(1);
   }
-  const ok = runCommand(dockerBin, ["compose", "-f", composeFile, "down"], {
-    label: `docker compose -f ${composeFile} down`,
-  });
-  clearEnginePidfile();
-  clearEngineState();
-  clearWorkerPidfile();
-  if (!ok) {
+
+  // Reap the native worker first so its shutdown flush (BM25/vector
+  // snapshots via iii state::set) lands while the engine is still up —
+  // same ordering as the native stop path. Previously the worker pidfile
+  // was cleared without ever signaling the process, leaking a worker on
+  // every Docker-mode stop.
+  const workerPid = readWorkerPidfile();
+  let workerStopped = true;
+  if (workerPid) {
+    workerStopped = await stopWorkerPid(workerPid, 5000);
+  }
+
+  // Scope teardown to agentmemory's own services. A bare `down` against a
+  // user-owned compose file tears down every service in it. `rm -s -f`
+  // stops and removes only the named containers.
+  let composeText = "";
+  try {
+    composeText = readFileSync(composeFile, "utf-8");
+  } catch {
+    composeText = "";
+  }
+  const ownServices = ["iii-engine", "iii-init"].filter((svc) =>
+    new RegExp(`^\\s+${svc}:`, "m").test(composeText),
+  );
+  if (ownServices.length === 0) {
     p.log.error(
-      `docker compose down failed. The engine may still be running on :${port}. Inspect with:\n  docker compose -f ${composeFile} ps`,
+      `${composeFile} does not define the agentmemory services (iii-engine/iii-init). Refusing to run an unscoped \`docker compose down\` against it — that would tear down every service in the file.\n\nStop the engine service manually:\n  docker compose -f ${composeFile} stop <service>`,
+    );
+    process.exit(1);
+  }
+  const ok = runCommand(
+    dockerBin,
+    ["compose", "-f", composeFile, "rm", "-s", "-f", ...ownServices],
+    {
+      label: `docker compose -f ${composeFile} rm -s -f ${ownServices.join(" ")}`,
+    },
+  );
+  // Clear each piece of state only after its shutdown succeeded, so a
+  // failed stop stays retryable.
+  if (workerStopped) clearWorkerPidfile();
+  if (ok) {
+    clearEnginePidfile();
+    clearEngineState();
+  } else {
+    p.log.error(
+      `docker compose rm failed. The engine may still be running on :${port}. Inspect with:\n  docker compose -f ${composeFile} ps`,
     );
     process.exit(1);
   }
@@ -2521,7 +2774,7 @@ async function runStop(): Promise<void> {
 
   const portPids = findEnginePidsByPort(port);
   const pidfilePid = readEnginePidfile();
-  // #640 + #474: read the worker pid up front so the engine-down branch
+  // read the worker pid up front so the engine-down branch
   // can still reap an orphaned worker process (the common failure mode
   // where a wrapper script kept the worker alive across engine restarts).
   const workerPid = readWorkerPidfile();
@@ -2583,7 +2836,7 @@ async function runStop(): Promise<void> {
   if (pidfilePid) candidates.add(pidfilePid);
   for (const pid of portPids) candidates.add(pid);
 
-  // #640 + #474: stop must also reap the agentmemory worker process
+  // stop must also reap the agentmemory worker process
   // (`node dist/index.mjs`). If only the engine is killed, the worker can
   // survive (detached spawn / signal not propagated) and reconnect to the
   // next engine as a duplicate registration. workerPid was read above so
@@ -2599,7 +2852,7 @@ async function runStop(): Promise<void> {
   }
 
   let allStopped = true;
-  // #843: stop worker first, then engine. The worker's shutdown
+  // stop worker first, then engine. The worker's shutdown
   // handler calls indexPersistence.save() -> kv.set() -> iii state::set
   // to flush BM25/vector snapshots + audit rows. Killing iii first
   // leaves those writes with no engine to land on, and the index +
@@ -2607,14 +2860,19 @@ async function runStop(): Promise<void> {
   // persists. Worker SIGTERM grace bumped 3s -> 5s to give a large
   // index a real chance to commit before the engine goes away.
   for (const pid of workerCandidates) {
-    const s = p.spinner();
-    s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
-    const ok = await signalAndWait(pid, "SIGTERM", 5000);
-    s.stop(ok ? `Stopped worker pid ${pid}` : `Failed to stop worker pid ${pid}`);
-    if (!ok) allStopped = false;
+    if (!(await stopWorkerPid(pid, 5000))) allStopped = false;
   }
+  const skippedForeign: Array<{ pid: number; comm: string }> = [];
   for (const pid of candidates) {
     if (workerCandidates.has(pid)) continue;
+    // Last-line guard against a stale/poisoned pidfile or a Docker
+    // port-forward holding :port — signaling com.docker.backend kills
+    // Docker Desktop's whole backend.
+    const comm = pidCommand(pid);
+    if (!force && isForeignPortHolder(comm)) {
+      skippedForeign.push({ pid, comm });
+      continue;
+    }
     const s = p.spinner();
     s.start(`Stopping iii-engine (pid ${pid})...`);
     const ok = await signalAndWait(pid, "SIGTERM", 3000);
@@ -2625,6 +2883,15 @@ async function runStop(): Promise<void> {
   clearEnginePidfile();
   clearEngineState();
   clearWorkerPidfile();
+  if (skippedForeign.length > 0) {
+    const list = skippedForeign
+      .map((sf) => `  pid ${sf.pid}  ${sf.comm}`)
+      .join("\n");
+    p.log.error(
+      `Refused to signal process(es) holding :${port} that are not the iii engine:\n${list}\n\nIf the engine runs in Docker, stop it there:\n  docker compose ps && docker compose rm -s -f <service>\n\nOr re-run with --force to signal them anyway.`,
+    );
+    process.exit(1);
+  }
   if (!allStopped) {
     p.log.error("One or more processes survived SIGKILL. Investigate with `ps`.");
     process.exit(1);
@@ -2646,7 +2913,7 @@ async function runImportJsonl(): Promise<void> {
   // consumed alongside the flag so they don't leak into positional
   // args (e.g. `--port 3112 import-jsonl` would otherwise turn
   // 3112 into pathArg).
-  const VALUE_FLAGS = new Set(["--port", "--tools"]);
+  const VALUE_FLAGS = new Set(["--port", "--tools", "--data-dir"]);
   let maxFiles: number | undefined;
   const tail = args.slice(1);
   const positional: string[] = [];
@@ -2972,7 +3239,18 @@ const commands: Record<string, () => Promise<void>> = {
   "import-jsonl": runImportJsonl,
 };
 
-const handler = commands[args[0] ?? ""] ?? main;
+const first = args[0] ?? "";
+async function unknownCommand(): Promise<void> {
+  p.log.error(
+    `Unknown command: ${first}. Supported: ${Object.keys(commands).join(", ")}. Run \`agentmemory\` with no arguments to start the memory server, or \`agentmemory --help\` for usage.`,
+  );
+  process.exit(1);
+}
+// Only a bare invocation or flag-style args boot the server; an unrecognized
+// word is an error. Previously any typo (or a guessed subcommand like
+// `agentmemory consolidate`) fell through to the full server boot and could
+// break a running daemon.
+const handler = commands[first] ?? (first && !first.startsWith("-") ? unknownCommand : main);
 handler().catch((err) => {
   p.log.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
