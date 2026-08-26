@@ -150,7 +150,7 @@ export const CORE_TOOLS: McpToolDef[] = [
         queryText: { type: "string", description: "Text query (e.g. 'login form with error banner')" },
         queryImageRef: { type: "string", description: "Absolute path to a stored image to match against" },
         queryImageBase64: { type: "string", description: "Raw base64 image bytes or data URL" },
-        topK: { type: "number", description: "Max results (default 10, max 50)" },
+        topK: { type: "number", description: "Max results (default 10, max 50). Alias: limit" },
         sessionId: { type: "string", description: "Filter to a single session" },
       },
     },

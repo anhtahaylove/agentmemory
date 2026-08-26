@@ -75,14 +75,18 @@ export function registerVisionSearchFunctions(
       queryImageRef?: string;
       queryImageBase64?: string;
       topK?: number;
+      limit?: number;
       sessionId?: string;
     }) => {
       if (!imageProvider?.embedImage) {
         return { success: false, error: "image embeddings disabled (set AGENTMEMORY_IMAGE_EMBEDDINGS=true)" };
       }
+      // Every other search function names this `limit`; accept both so the
+      // wrong key cannot silently collapse the result set to the default (#1254).
+      const requested = data?.topK ?? data?.limit;
       const requestedTopK =
-        typeof data?.topK === "number" && Number.isFinite(data.topK)
-          ? Math.trunc(data.topK)
+        typeof requested === "number" && Number.isFinite(requested)
+          ? Math.trunc(requested)
           : 10;
       const topK = Math.min(50, Math.max(1, requestedTopK));
 
