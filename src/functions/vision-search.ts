@@ -81,8 +81,6 @@ export function registerVisionSearchFunctions(
       if (!imageProvider?.embedImage) {
         return { success: false, error: "image embeddings disabled (set AGENTMEMORY_IMAGE_EMBEDDINGS=true)" };
       }
-      // Every other search function names this `limit`; accept both so the
-      // wrong key cannot silently collapse the result set to the default (#1254).
       const requested = data?.topK ?? data?.limit;
       const requestedTopK =
         typeof requested === "number" && Number.isFinite(requested)

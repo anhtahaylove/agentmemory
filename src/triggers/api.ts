@@ -2080,8 +2080,6 @@ export function registerApiTriggers(
           body: { error: "queryText, queryImageRef, or queryImageBase64 required" },
         };
       }
-      // `limit` is what every other search endpoint takes, so accept it as an
-      // alias rather than silently returning the default 10 (#1254).
       const topKRaw = body["topK"] ?? body["limit"];
       const topKParsed = parseOptionalPositiveInt(topKRaw);
       if (topKParsed === null) {
