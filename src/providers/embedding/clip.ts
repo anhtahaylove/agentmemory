@@ -7,13 +7,14 @@ type ClipPipeline = (
   input: string[] | RawImage | RawImage[],
   options?: { pooling?: string; normalize?: boolean },
 ) => Promise<{ tolist: () => number[][]; data: Float32Array }>;
+type ClipTextEncoder = (texts: string[]) => Promise<Float32Array[]>;
 
 const DEFAULT_MODEL = "Xenova/clip-vit-base-patch32";
 
 export class ClipEmbeddingProvider implements EmbeddingProvider {
   readonly name = "clip";
   readonly dimensions = 512;
-  private textExtractor: ClipPipeline | null = null;
+  private textExtractor: ClipTextEncoder | null = null;
   private imageExtractor: ClipPipeline | null = null;
   private readonly modelId: string;
 
@@ -27,9 +28,8 @@ export class ClipEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
-    const extractor = await this.getTextExtractor();
-    const output = await extractor(texts, { pooling: "mean", normalize: true });
-    return output.tolist().map((v) => new Float32Array(v));
+    const encode = await this.getTextExtractor();
+    return encode(texts);
   }
 
   async embedImage(src: string): Promise<Float32Array> {
@@ -41,10 +41,24 @@ export class ClipEmbeddingProvider implements EmbeddingProvider {
     return normalize(vec);
   }
 
-  private async getTextExtractor(): Promise<ClipPipeline> {
+  private async getTextExtractor(): Promise<ClipTextEncoder> {
     if (this.textExtractor) return this.textExtractor;
     const t = await loadTransformers();
-    this.textExtractor = (await t.pipeline("feature-extraction", this.modelId, { dtype: "q8" })) as ClipPipeline;
+    // CLIP repos expose a dual-encoder. The generic "feature-extraction"
+    // pipeline instantiates the full CLIPModel, whose forward pass requires
+    // both input_ids and pixel_values, so a text-only call fails with
+    // "Missing the following inputs: pixel_values". Load the text tower with
+    // its projection head instead: that is the encoder whose output shares
+    // the 512-d contrastive space with the image embeddings.
+    const tokenizer = await t.AutoTokenizer.from_pretrained(this.modelId);
+    const model = await t.CLIPTextModelWithProjection.from_pretrained(this.modelId, {
+      dtype: "q8",
+    });
+    this.textExtractor = async (texts: string[]) => {
+      const inputs = tokenizer(texts, { padding: true, truncation: true });
+      const { text_embeds } = await model(inputs);
+      return text_embeds.tolist().map((v: number[]) => normalize(new Float32Array(v)));
+    };
     return this.textExtractor;
   }
 
