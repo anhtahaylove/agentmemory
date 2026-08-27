@@ -6,7 +6,7 @@ describe("runtime metadata paths", () => {
   it("uses an explicit runtime directory so instances do not share metadata", () => {
     expect(
       runtimeMetadataPath("engine-state.json", {
-        env: { AGENTMEMORY_RUNTIME_DIR: resolve("/var/lib/agentmemory/instance-2") },
+        env: { AGENTMEMORY_RUNTIME_DIR: "/var/lib/agentmemory/instance-2" },
         home: "/home/test",
       }),
     ).toBe(join(resolve("/var/lib/agentmemory/instance-2"), "engine-state.json"));
