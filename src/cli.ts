@@ -3122,13 +3122,25 @@ async function runDemoBody(base: string) {
 // and `shell: true` would concatenate the arguments into a command line
 // where a container id containing shell metacharacters is interpreted.
 // Routing through cmd.exe with the arguments still passed as a real argv
-// keeps them opaque to the interpreter.
+// keeps most metacharacters opaque, but cmd.exe still expands %VAR% and a
+// literal " can close the quoting cmd.exe wraps each argv entry in — reject
+// both rather than trying to escape them. Every caller here passes Docker
+// container ids ([0-9a-f]{12,64}) or compose project names ([\w-]+), so a
+// real value never trips this.
+const CMD_UNSAFE = /["%]/;
+
 function spawnBinary(
   binary: string,
   binaryArgs: string[],
   options: Parameters<typeof spawnSync>[2],
 ): ReturnType<typeof spawnSync> {
   if (IS_WINDOWS && /\.(cmd|bat)$/i.test(binary)) {
+    const unsafe = binaryArgs.find((arg) => CMD_UNSAFE.test(arg));
+    if (unsafe !== undefined) {
+      throw new Error(
+        `refusing to spawn ${JSON.stringify(binary)}: argument ${JSON.stringify(unsafe)} contains a character (" or %) that is not safe to pass through cmd.exe`,
+      );
+    }
     const comspec = process.env["ComSpec"] || "cmd.exe";
     return spawnSync(comspec, ["/d", "/s", "/c", binary, ...binaryArgs], options);
   }

@@ -369,3 +369,60 @@ describe("native removal shutdown", () => {
     expect(`${result.stdout}\n${result.stderr}`).toContain("stop --instance 1");
   });
 });
+
+describe.runIf(IS_WIN)("cmd.exe argument safety (#1264)", () => {
+  it("does not let cmd.exe expand a %VAR% hiding inside a container id", () => {
+    const root = sandbox();
+    const home = join(root, "home");
+    const runtimeDir = join(home, ".agentmemory");
+    const dataDir = join(root, "data");
+    const binDir = join(root, "bin");
+    const dockerLog = join(root, "docker.log");
+    mkdirSync(runtimeDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    installFakeDocker(binDir);
+    const statePath = join(runtimeDir, "engine-state.json");
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        kind: "docker",
+        schemaVersion: 2,
+        composeFile: join(root, "docker-compose.yml"),
+        projectName: "agentmemory-3111",
+        engineVersion: "0.11.2",
+        restPort: 3111,
+        dataDir,
+        containerId: "candidate-%TEMP%",
+        dataMountType: "bind",
+        dataMountSource: dataDir,
+        preserveContainer: false,
+      }),
+    );
+
+    spawnSync(
+      process.execPath,
+      ["--import", "tsx", "src/cli.ts", "stop", "--data-dir", dataDir],
+      {
+        cwd: process.cwd(),
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          CI: "1",
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          DOCKER_LOG: dockerLog,
+          DOCKER_FAILURE_MODE: "none",
+          DOCKER_DATA_DIR: dataDir,
+          FULL_CONTAINER_ID,
+        },
+      },
+    );
+
+    const log = existsSync(dockerLog) ? readFileSync(dockerLog, "utf-8") : "";
+    // The fake docker echoes whatever argv it actually received. If
+    // cmd.exe expanded the variable before docker saw it, the log
+    // carries a real filesystem path instead of the literal token.
+    expect(log).not.toContain("AppData");
+  });
+});
