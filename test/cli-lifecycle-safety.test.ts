@@ -399,7 +399,8 @@ describe.runIf(IS_WIN)("cmd.exe argument safety (#1264)", () => {
       }),
     );
 
-    spawnSync(
+    const tempSentinel = join(root, "cmd-expansion-sentinel");
+    const result = spawnSync(
       process.execPath,
       ["--import", "tsx", "src/cli.ts", "stop", "--data-dir", dataDir],
       {
@@ -409,6 +410,7 @@ describe.runIf(IS_WIN)("cmd.exe argument safety (#1264)", () => {
           ...process.env,
           HOME: home,
           USERPROFILE: home,
+          TEMP: tempSentinel,
           CI: "1",
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
           DOCKER_LOG: dockerLog,
@@ -419,10 +421,7 @@ describe.runIf(IS_WIN)("cmd.exe argument safety (#1264)", () => {
       },
     );
 
-    const log = existsSync(dockerLog) ? readFileSync(dockerLog, "utf-8") : "";
-    // The fake docker echoes whatever argv it actually received. If
-    // cmd.exe expanded the variable before docker saw it, the log
-    // carries a real filesystem path instead of the literal token.
-    expect(log).not.toContain("AppData");
+    expect(result.status).not.toBe(0);
+    expect(existsSync(dockerLog)).toBe(false);
   });
 });
